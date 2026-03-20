@@ -1,3 +1,18 @@
+# Legado·Z (魔改版)
+
+> 基于 [gedoor/legado](https://github.com/gedoor/legado) 的修改版本，针对外部 TTS 引擎的朗读体验进行优化。
+
+## 修改内容
+
+- **HTTP TTS 按句传送**：将 `HttpReadAloudService` 的文本传送粒度从段落级改为句子级，大幅减少大段落的首句等待时间，消除朗读卡顿。
+- **包名独立**：`applicationId` 改为 `io.legado.app.zian`，可与原版 Legado 共存安装。
+- **应用名区分**：中文"阅读·Z"，英文"Legado·Z"。
+- **移除 Firebase**：禁用了 Google Services 和 Firebase 崩溃统计。
+
+---
+
+# 以下为原版 README
+
 # [English](English.md) [中文](README.md)
 
 [![icon_android](https://github.com/gedoor/gedoor.github.io/blob/master/static/img/legado/icon_android.png)](https://play.google.com/store/apps/details?id=io.legado.play.release)
