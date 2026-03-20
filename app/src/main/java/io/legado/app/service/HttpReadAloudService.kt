@@ -95,6 +95,13 @@ class HttpReadAloudService : BaseReadAloudService(),
     private var playErrorNo = 0
     private val downloadTaskActiveLock = Mutex()
 
+    // === 句子级切分元数据 ===
+    private var sentenceList = mutableListOf<String>()       // 所有句子的扁平列表
+    private var sentenceLengths = mutableListOf<Int>()        // 每句长度
+    private var sentenceParagraphIndex = mutableListOf<Int>() // 句子所属的段落索引
+    private var sentenceIsLastInPara = mutableListOf<Boolean>() // 是否为段落最后一句
+    private var currentSentenceIndex = 0                      // 当前播到第几句
+
     override fun onCreate() {
         super.onCreate()
         exoPlayer.addListener(this)
@@ -132,11 +139,80 @@ class HttpReadAloudService : BaseReadAloudService(),
         playIndexJob?.cancel()
     }
 
+    /**
+     * 将段落文本按句末标点拆分为句子列表。
+     * 过短句 (<5字) 合并到下一句，保证 TTS 引擎效率。
+     */
+    private fun splitToSentences(text: String): List<String> {
+        if (text.length <= 30) return listOf(text)
+        val parts = text.split(Regex("(?<=[。！？；!?\n])")).filter { it.isNotBlank() }
+        if (parts.size <= 1) return listOf(text)
+        val merged = mutableListOf<String>()
+        var buffer = ""
+        for (part in parts) {
+            buffer += part
+            if (buffer.length >= 5) {
+                merged.add(buffer)
+                buffer = ""
+            }
+        }
+        if (buffer.isNotEmpty()) {
+            if (merged.isNotEmpty()) {
+                merged[merged.lastIndex] = merged.last() + buffer
+            } else {
+                merged.add(buffer)
+            }
+        }
+        return merged.ifEmpty { listOf(text) }
+    }
+
+    /**
+     * 构建句子级扁平列表和段落映射元数据。
+     * 将 contentList 中的每个段落按标点切分为句子。
+     */
+    private fun buildSentenceList() {
+        sentenceList.clear()
+        sentenceLengths.clear()
+        sentenceParagraphIndex.clear()
+        sentenceIsLastInPara.clear()
+        currentSentenceIndex = 0
+        contentList.forEachIndexed { index, content ->
+            if (index < nowSpeak) return@forEachIndexed
+            var text = content
+            if (paragraphStartPos > 0 && index == nowSpeak) {
+                text = text.substring(paragraphStartPos)
+            }
+            val sentences = splitToSentences(text)
+            sentences.forEachIndexed { sIdx, sentence ->
+                sentenceList.add(sentence)
+                sentenceLengths.add(sentence.length)
+                sentenceParagraphIndex.add(index)
+                sentenceIsLastInPara.add(sIdx == sentences.lastIndex)
+            }
+        }
+    }
+
+    /**
+     * 句子播完后更新朗读进度。
+     * 按句子递增 readAloudNumber，只在段落最后一句时递增 nowSpeak。
+     */
     private fun updateNextPos() {
-        readAloudNumber += contentList[nowSpeak].length + 1 - paragraphStartPos
-        paragraphStartPos = 0
-        if (nowSpeak < contentList.lastIndex) {
-            nowSpeak++
+        val idx = currentSentenceIndex
+        if (idx < sentenceList.size) {
+            readAloudNumber += sentenceLengths[idx]
+            if (sentenceIsLastInPara[idx]) {
+                // 段落最后一句：加上换行符的计数，递增到下一段落
+                readAloudNumber += 1 - paragraphStartPos
+                paragraphStartPos = 0
+                if (nowSpeak < contentList.lastIndex) {
+                    nowSpeak++
+                } else {
+                    currentSentenceIndex++
+                    nextChapter()
+                    return
+                }
+            }
+            currentSentenceIndex++
         } else {
             nextChapter()
         }
@@ -149,17 +225,15 @@ class HttpReadAloudService : BaseReadAloudService(),
             downloadTaskActiveLock.withLock {
                 ensureActive()
                 val httpTts = ReadAloud.httpTTS ?: throw NoStackTraceException("tts is null")
-                contentList.forEachIndexed { index, content ->
+                // 构建句子级列表
+                buildSentenceList()
+                // 逐句下载并加入 ExoPlayer
+                for (sentence in sentenceList) {
                     ensureActive()
-                    if (index < nowSpeak) return@forEachIndexed
-                    var text = content
-                    if (paragraphStartPos > 0 && index == nowSpeak) {
-                        text = text.substring(paragraphStartPos)
-                    }
-                    val fileName = md5SpeakFileName(text)
-                    val speakText = text.replace(AppPattern.notReadAloudRegex, "")
+                    val fileName = md5SpeakFileName(sentence)
+                    val speakText = sentence.replace(AppPattern.notReadAloudRegex, "")
                     if (speakText.isEmpty()) {
-                        AppLog.put("阅读段落内容为空，使用无声音频代替。\n朗读文本：$text")
+                        AppLog.put("朗读句子内容为空，使用无声音频代替。\n朗读文本：$sentence")
                         createSilentSound(fileName)
                     } else if (!hasSpeakFile(fileName)) {
                         runCatching {
@@ -229,18 +303,16 @@ class HttpReadAloudService : BaseReadAloudService(),
                         downloader.download(null)
                     }
                 }
-                contentList.forEachIndexed { index, content ->
+                // 构建句子级列表
+                buildSentenceList()
+                // 逐句流式下载并加入 ExoPlayer
+                for (sentence in sentenceList) {
                     ensureActive()
-                    if (index < nowSpeak) return@forEachIndexed
-                    var text = content
-                    if (paragraphStartPos > 0 && index == nowSpeak) {
-                        text = text.substring(paragraphStartPos)
-                    }
-                    val speakText = text.replace(AppPattern.notReadAloudRegex, "")
+                    val speakText = sentence.replace(AppPattern.notReadAloudRegex, "")
                     if (speakText.isEmpty()) {
-                        AppLog.put("阅读段落内容为空，使用无声音频代替。\n朗读文本：$speakText")
+                        AppLog.put("朗读句子内容为空，使用无声音频代替。\n朗读文本：$speakText")
                     }
-                    val fileName = md5SpeakFileName(text)
+                    val fileName = md5SpeakFileName(sentence)
                     val dataSourceFactory = createDataSourceFactory(httpTts, speakText)
                     val downloader = createDownloader(dataSourceFactory, fileName)
                     downloaderChannel.send(downloader)
@@ -472,13 +544,20 @@ class HttpReadAloudService : BaseReadAloudService(),
             if (exoPlayer.duration <= 0) {
                 return@launch
             }
-            val speakTextLength = contentList[nowSpeak].length
+            // 使用当前句子长度而非段落长度来估算进度
+            val speakTextLength = if (currentSentenceIndex < sentenceLengths.size) {
+                sentenceLengths[currentSentenceIndex]
+            } else if (nowSpeak < contentList.size) {
+                contentList[nowSpeak].length
+            } else {
+                return@launch
+            }
             if (speakTextLength <= 0) {
                 return@launch
             }
             val sleep = exoPlayer.duration / speakTextLength
             val start = speakTextLength * exoPlayer.currentPosition / exoPlayer.duration
-            for (i in start..contentList[nowSpeak].length) {
+            for (i in start..speakTextLength) {
                 if (pageIndex + 1 < textChapter.pageSize
                     && readAloudNumber + i > textChapter.getReadLength(pageIndex + 1)
                 ) {
@@ -556,7 +635,14 @@ class HttpReadAloudService : BaseReadAloudService(),
 
     override fun onPlayerError(error: PlaybackException) {
         super.onPlayerError(error)
-        AppLog.put("朗读错误\n${contentList[nowSpeak]}", error)
+        val errorText = if (currentSentenceIndex < sentenceList.size) {
+            sentenceList[currentSentenceIndex]
+        } else if (nowSpeak < contentList.size) {
+            contentList[nowSpeak]
+        } else {
+            "(unknown)"
+        }
+        AppLog.put("朗读错误\n$errorText", error)
         deleteCurrentSpeakFile()
         playErrorNo++
         if (playErrorNo >= 5) {
